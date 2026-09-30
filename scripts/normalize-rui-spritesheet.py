@@ -9,6 +9,7 @@ quadro ao mesmo chao usado pelo runtime.
 import sys
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 
@@ -17,6 +18,39 @@ FRAME_W, FRAME_H = 320, 256
 CONTENT_MARGIN_X = 8
 CONTENT_MARGIN_TOP = 8
 BASELINE = 248
+SAFE_FALLBACK_ROWS = {6: 2, 7: 4}
+
+
+def keep_primary_vertical_band(cell: Image.Image) -> Image.Image:
+    """Remove detached pixels from the next/previous generated pose.
+
+    Image generators sometimes place a small part of an adjacent pose inside
+    the same source cell. The real pose is the largest contiguous vertical
+    band; keeping that band prevents shoes, legs and heads from leaking into
+    the next animation row.
+    """
+    alpha = np.array(cell.getchannel("A")) > 0
+    filled = alpha.any(axis=1)
+    bands = []
+    start = None
+    for y, has_pixels in enumerate(filled):
+        if has_pixels and start is None:
+            start = y
+        elif not has_pixels and start is not None:
+            bands.append((start, y))
+            start = None
+    if start is not None:
+        bands.append((start, len(filled)))
+    if len(bands) <= 1:
+        return cell
+
+    top, bottom = max(bands, key=lambda band: int(alpha[band[0] : band[1]].sum()))
+    cleaned = cell.copy()
+    if top:
+        cleaned.paste((0, 0, 0, 0), (0, 0, cleaned.width, top))
+    if bottom < cleaned.height:
+        cleaned.paste((0, 0, 0, 0), (0, bottom, cleaned.width, cleaned.height))
+    return cleaned
 
 
 def normalize(source: Path, destination: Path) -> None:
@@ -27,6 +61,8 @@ def normalize(source: Path, destination: Path) -> None:
     result = Image.new("RGBA", (COLS * FRAME_W, ROWS * FRAME_H), (0, 0, 0, 0))
 
     for row in range(ROWS):
+        if row in SAFE_FALLBACK_ROWS:
+            continue
         for col in range(COLS):
             x0 = round(col * source_w / COLS)
             x1 = round((col + 1) * source_w / COLS)
@@ -34,6 +70,7 @@ def normalize(source: Path, destination: Path) -> None:
             y1 = round((row + 1) * source_h / ROWS)
             cell = sheet.crop((x0, y0, x1, y1))
 
+            cell = keep_primary_vertical_band(cell)
             alpha = cell.getchannel("A")
             bbox = alpha.getbbox()
             if bbox is None:
@@ -49,6 +86,18 @@ def normalize(source: Path, destination: Path) -> None:
             x = col * FRAME_W + (FRAME_W - resized.width) // 2
             y = row * FRAME_H + BASELINE - resized.height
             result.alpha_composite(resized, (x, y))
+
+    for row, source_row in SAFE_FALLBACK_ROWS.items():
+        for col in range(COLS):
+            source_box = (
+                col * FRAME_W,
+                source_row * FRAME_H,
+                (col + 1) * FRAME_W,
+                (source_row + 1) * FRAME_H,
+            )
+            target = (col * FRAME_W, row * FRAME_H)
+            frame = result.crop(source_box)
+            result.alpha_composite(frame, target)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     result.save(destination, "PNG", optimize=True)
