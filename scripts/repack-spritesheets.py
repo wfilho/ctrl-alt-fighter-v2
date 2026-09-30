@@ -33,7 +33,6 @@ import glob
 
 import numpy as np
 from PIL import Image
-from scipy import ndimage
 
 FRAME_W, FRAME_H = 320, 256
 COLS, ROWS = 4, 8
@@ -54,6 +53,10 @@ TARGET_IDLE_H = 218
 NEAR_RADIUS = 34
 # Area minima (em pixels) para um pedaco solto ser considerado parte do corpo.
 MIN_FRAGMENT_AREA = 120
+# Um fragmento tambem precisa representar uma parte relevante do corpo. Isso
+# elimina cabecas/tenis vazados de outra pose sem remover pernas e bracos que
+# ficaram separados por uma falha de transparencia.
+MIN_FRAGMENT_RATIO = 0.15
 ALPHA_CUTOFF = 24
 # Faixas verticais separadas por ate este numero de linhas vazias sao partes
 # do mesmo corpo (falha de contorno), nao poses diferentes. Medicao: cortes
@@ -62,6 +65,57 @@ MERGE_BAND_GAP = 11
 # Fracao da maior faixa que uma faixa precisa ter para ser considerada uma
 # figura (e nao poeira/sombra/faisca) na hora de escolher a pose apoiada.
 BODY_BAND_RATIO = 0.35
+
+
+def label_components(mask):
+    """Rotula componentes 4-conectados sem depender de scipy."""
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    sizes = []
+    next_label = 0
+    height, width = mask.shape
+
+    for y, x in zip(*np.where(mask)):
+        if labels[y, x]:
+            continue
+
+        next_label += 1
+        labels[y, x] = next_label
+        stack = [(int(y), int(x))]
+        size = 0
+        while stack:
+            current_y, current_x = stack.pop()
+            size += 1
+            for neighbor_y, neighbor_x in (
+                (current_y - 1, current_x),
+                (current_y + 1, current_x),
+                (current_y, current_x - 1),
+                (current_y, current_x + 1),
+            ):
+                if (
+                    0 <= neighbor_y < height
+                    and 0 <= neighbor_x < width
+                    and mask[neighbor_y, neighbor_x]
+                    and not labels[neighbor_y, neighbor_x]
+                ):
+                    labels[neighbor_y, neighbor_x] = next_label
+                    stack.append((neighbor_y, neighbor_x))
+        sizes.append(size)
+
+    return labels, np.asarray(sizes, dtype=np.int64)
+
+
+def is_near_main(component, main_mask, radius):
+    """Retorna se algum pixel do componente esta na vizinhanca do corpo."""
+    component_rows = np.where(component.any(axis=1))[0]
+    for y in component_rows:
+        component_xs = np.where(component[y])[0]
+        x0 = max(0, int(component_xs.min()) - radius)
+        x1 = min(component.shape[1], int(component_xs.max()) + radius + 1)
+        y0 = max(0, int(y) - radius)
+        y1 = min(component.shape[0], int(y) + radius + 1)
+        if main_mask[y0:y1, x0:x1].any():
+            return True
+    return False
 
 
 def main_band(mask):
@@ -120,19 +174,17 @@ def clean_cell(cell_rgba):
     if not mask.any():
         return None, None
 
-    labels, count = ndimage.label(mask)
-    sizes = ndimage.sum(mask, labels, range(1, count + 1))
+    labels, sizes = label_components(mask)
+    count = len(sizes)
     main = int(np.argmax(sizes)) + 1
     main_mask = labels == main
-
-    structure = np.ones((2 * NEAR_RADIUS + 1, 2 * NEAR_RADIUS + 1), bool)
-    neighborhood = ndimage.binary_dilation(main_mask, structure=structure)
+    main_area = int(sizes[main - 1])
 
     keep = main_mask.copy()
     for index in range(1, count + 1):
         if index == main:
             continue
-        if sizes[index - 1] < MIN_FRAGMENT_AREA:
+        if sizes[index - 1] < max(MIN_FRAGMENT_AREA, main_area * MIN_FRAGMENT_RATIO):
             continue
         component = labels == index
 
@@ -142,12 +194,16 @@ def clean_cell(cell_rgba):
         # desenhada na mesma celula, entao NAO entra.
         component_ys = np.where(component.any(axis=1))[0]
         main_ys = np.where(main_mask.any(axis=1))[0]
-        vertical_gap = max(int(component_ys.min()) - int(main_ys.max()),
-                           int(main_ys.min()) - int(component_ys.max()))
+        if component_ys.max() < main_ys.min():
+            vertical_gap = int(main_ys.min()) - int(component_ys.max()) - 1
+        elif main_ys.max() < component_ys.min():
+            vertical_gap = int(component_ys.min()) - int(main_ys.max()) - 1
+        else:
+            vertical_gap = 0
         if vertical_gap > MERGE_BAND_GAP:
             continue
 
-        if (component & neighborhood).any():
+        if is_near_main(component, main_mask, NEAR_RADIUS):
             keep |= component
 
     cleaned = cell_rgba.copy()

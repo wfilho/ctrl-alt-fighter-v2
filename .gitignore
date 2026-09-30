@@ -4,5 +4,6 @@ dist.new/
 .pnpm-store/
 _tmp_*
 scripts/__pycache__/
+__pycache__/
 .sites-runtime/
 .superpowers/
